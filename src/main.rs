@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -34,6 +35,8 @@ pub mod config {
     pub struct Config {
         /// Optional router IP address that will be used to query the external IP address using UPnP.
         pub router_ip: Option<std::net::IpAddr>,
+        /// Optional router UPNP URL to the /device_description.xml or quivalent file.
+        pub router_url: Option<String>,
         /// The interval in minutes to check if the IP address changed.
         /// May be fractional (i.e. `0.5`).
         pub interval: f64,
@@ -58,6 +61,11 @@ pub mod config {
                 }
             } else {
                 log::info!("No router_ip configured, detecting from the network.")
+            }
+            if let Some(url) = &self.router_url {
+                log::info!("Using configured router_url '{url}'.")
+            } else {
+                log::info!("No router_url configured.")
             }
             if let Some(cf) = &self.cloudflare {
                 log::info!(
@@ -131,6 +139,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let config::Config {
         router_ip,
+        router_url,
         interval,
         cloudflare: cf,
         mut urls,
@@ -140,7 +149,11 @@ pub async fn main() -> anyhow::Result<()> {
     // Discover the internet gateway device to be querried or watch the local ip
     // if loopback.
     log::info!("Discovering internet gateway..");
-    let mut service = IpService::new(router_ip, true).await?;
+    let mut service = if let Some(url) = router_url {
+        IpService::from_url(url).await?
+    } else {
+        IpService::new(router_ip, true).await?
+    };
 
     let (cf_auth, mut cf_updaters) = if let Some(cf) = cf {
         let updaters = cf
@@ -342,6 +355,19 @@ impl IpService {
             Ok(IpService::UPnP(upnp_service))
         }
     }
+
+    /// Create an IP address service.
+    /// Query the given UPnP url to the router's given by `ipaddr` or the first
+    /// discovered.
+    pub async fn from_url(url: String) -> Result<Self> {
+        let upnp_service = UPnPIpService::new_url_connection_service(&url).await?;
+        log::info!(
+            "Using router '{}' at '{}' to get the external IP address.",
+            upnp_service.router_name(),
+            upnp_service.router_ip()
+        );
+        Ok(IpService::UPnP(upnp_service))
+    }
 }
 
 /// A service that queries the external IP address from the router using UPnP.
@@ -352,6 +378,34 @@ pub struct UPnPIpService {
 }
 
 impl UPnPIpService {
+    pub async fn from_gateway(gateway: rupnp::Device) -> Result<Self> {
+        const WANIP_CON_SERVICE: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
+        const WAN_DEVICE: URN = URN::device("schemas-upnp-org", "WANDevice", 1);
+        const WAN_CONNECTION_DEVICE: URN =
+            URN::device("schemas-upnp-org", "WANConnectionDevice", 1);
+
+        let device = gateway
+            .devices_iter()
+            .find(|d| *d.device_type() == WAN_DEVICE)
+            .with_context(|| anyhow!("could not find WAN device"))?
+            .devices_iter()
+            .find(|d| *d.device_type() == WAN_CONNECTION_DEVICE)
+            .with_context(|| anyhow!("could not find WAN connection device"))?;
+
+        let service = device
+            .services_iter()
+            .find(|d| *d.service_type() == WANIP_CON_SERVICE)
+            .with_context(|| anyhow!("could not find WAN IP connection service"))?;
+
+        let service_scpd = service.scpd(gateway.url()).await?;
+
+        Ok(UPnPIpService {
+            service: service.clone(),
+            service_scpd,
+            device: gateway,
+        })
+    }
+
     pub fn router_ip(&self) -> &str {
         self.device.url().host().unwrap()
     }
@@ -365,10 +419,6 @@ impl UPnPIpService {
     async fn new_ip_connection_service(ipaddr: Option<std::net::IpAddr>) -> Result<UPnPIpService> {
         const INTERNET_GATEWAY_DEVICE: URN =
             URN::device("schemas-upnp-org", "InternetGatewayDevice", 1);
-        const WANIP_CON_SERVICE: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
-        const WAN_DEVICE: URN = URN::device("schemas-upnp-org", "WANDevice", 1);
-        const WAN_CONNECTION_DEVICE: URN =
-            URN::device("schemas-upnp-org", "WANConnectionDevice", 1);
 
         let devices = rupnp::discover(
             &rupnp::ssdp::SearchTarget::URN(INTERNET_GATEWAY_DEVICE),
@@ -411,26 +461,16 @@ impl UPnPIpService {
             }
         };
 
-        let device = gateway
-            .devices_iter()
-            .find(|d| *d.device_type() == WAN_DEVICE)
-            .with_context(|| anyhow!("could not find WAN device"))?
-            .devices_iter()
-            .find(|d| *d.device_type() == WAN_CONNECTION_DEVICE)
-            .with_context(|| anyhow!("could not find WAN connection device"))?;
+        UPnPIpService::from_gateway(gateway).await
+    }
 
-        let service = device
-            .services_iter()
-            .find(|d| *d.service_type() == WANIP_CON_SERVICE)
-            .with_context(|| anyhow!("could not find WAN IP connection service"))?;
+    /// Get the `WANIPConnection` service from the `InternetGatewayDevice` matching `ipaddr` using
+    /// [UPnP WAN Common Interface Config](http://upnp.org/specs/gw/UPnP-gw-WANCommonInterfaceConfig-v1-Service.pdf).
+    async fn new_url_connection_service(url: &str) -> Result<UPnPIpService> {
+        let http_url = rupnp::http::Uri::from_str(url)?;
+        let gateway = rupnp::Device::from_url(http_url).await?;
 
-        let service_scpd = service.scpd(gateway.url()).await?;
-
-        Ok(UPnPIpService {
-            service: service.clone(),
-            service_scpd,
-            device: gateway,
-        })
+        UPnPIpService::from_gateway(gateway).await
     }
 
     /// Get the external ip address.
