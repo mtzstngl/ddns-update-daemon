@@ -14,6 +14,7 @@ Runs on Linux, Windows and Mac.
 **Features**
 - Watching the external IP address with UPnP.
     - Note: UPnP port-forwarding doesn't need to be enabled for this.
+    - Device discovery by specifying the URL or IP.
 - Watching the local IP address.
 - Updaters
     - [Cloudflare](https://www.cloudflare.com/) by using the cloudflare API to update DNS records.
@@ -46,6 +47,13 @@ interval = 30
 # If set to loopback (127.0.0.1), the local IP address will be watched
 # by querying the OS of the current local IP address.
 router_ip = "192.168.1.1"
+
+# Alterantive to the 'router_ip', if this is configured the 'router_ip' is
+# ignored.
+# This can be used to directly configure the router UPNP url. This should point
+# to the device description for an
+# 'urn:schemas-upnp-org:device:InternetGatewayDevice:1'
+router_url = "http://192.168.1.1:49000/igddesc.xml"
 
 # Cloudflare DNS records to update. Optional.
 [cloudflare]
